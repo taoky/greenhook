@@ -439,7 +439,6 @@ mod tests {
         assert_eq!(buf.trim(), "root");
     }
 
-    #[ignore = "todo"]
     #[test]
     fn test_sleep_blocking_syscall() {
         let mut supervisor = Supervisor::new().unwrap();
@@ -447,14 +446,23 @@ mod tests {
             ScmpSyscall::new("clock_nanosleep"),
             Box::new(|req| {
                 // sleep for extra 60s
-                let handler = std::thread::spawn(|| {
-                    std::thread::sleep(Duration::from_secs(60));
+                // Please note that it may bring A LOT OF PROBLEMS if you try using pthread_cancel
+                // So here we just use the easy way: check valid in the loop
+                let (tx, rx) = std::sync::mpsc::channel();
+                let handler = std::thread::spawn(move || {
+                    for _ in 0..60 {
+                        if rx.try_recv().is_ok() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                 });
                 // while handler is running, check valid in the loop
                 loop {
                     if !req.is_valid() {
                         // cancel the thread
                         info!("canceling thread as req is invalid now");
+                        tx.send(()).unwrap();
                         return req.fail_syscall(libc::EACCES);
                     }
                     if handler.is_finished() {
