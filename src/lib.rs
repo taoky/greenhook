@@ -81,8 +81,10 @@ impl Sender {
     pub(crate) fn sendfd(&self, fd: RawFd) -> Result<(), io::Error> {
         const FD_SIZE: c_uint = size_of::<RawFd>() as c_uint;
         const CAPACITY: u32 = unsafe { CMSG_SPACE(FD_SIZE) };
-        let buf = [0u8; CAPACITY as usize];
-        let cmsg_ptr = buf.as_ptr() as *mut c_void;
+        const ALIGNMENT: usize = mem::align_of::<cmsghdr>();
+        let buf = [0u8; ALIGNMENT + CAPACITY as usize];
+        let (_prefix, aligned_buf, _suffix) = unsafe { buf.align_to::<cmsghdr>() };
+        let cmsg_ptr = aligned_buf.as_ptr() as *mut c_void;
         let mut _binding = [0; 1];
         let mut _iov_buffer = [IoSliceMut::new(&mut _binding); 1];
 
@@ -103,7 +105,7 @@ impl Sender {
             mhdr.assume_init()
         };
 
-        let mut pmhdr: *mut cmsghdr = unsafe { CMSG_FIRSTHDR(&mhdr) };
+        let pmhdr: *mut cmsghdr = unsafe { CMSG_FIRSTHDR(&mhdr) };
 
         unsafe {
             (*pmhdr).cmsg_level = libc::SOL_SOCKET;
@@ -146,6 +148,8 @@ impl Receiver {
     }
 }
 
+/// UNotifyEventRequest is the type of parameter that user's function
+/// would get.
 #[derive(Debug)]
 pub struct UNotifyEventRequest {
     request: libseccomp::ScmpNotifReq,
@@ -157,31 +161,40 @@ impl UNotifyEventRequest {
         UNotifyEventRequest { request, notify_fd }
     }
 
+    /// Returns the unotify request (`libseccomp::ScmpNotifReq`) of
+    /// this event.
     pub fn get_request(&self) -> &libseccomp::ScmpNotifReq {
         &self.request
     }
 
-    /// CAUTION! This method is unsafe because it may suffer TOCTOU attack.
+    /// Let the kernel continue the syscall.
     ///
     /// # Safety
+    /// CAUTION! This method is unsafe because it may suffer TOCTOU attack.
     /// Please read seccomp_unotify(2) "NOTES/Design goals; use of SECCOMP_USER_NOTIF_FLAG_CONTINUE"
     /// before using this method.
     pub unsafe fn continue_syscall(&self) -> libseccomp::ScmpNotifResp {
         libseccomp::ScmpNotifResp::new(self.request.id, 0, 0, ScmpNotifRespFlags::CONTINUE.bits())
     }
 
+    /// Returns error to supervised process.
     pub fn fail_syscall(&self, err: i32) -> libseccomp::ScmpNotifResp {
         libseccomp::ScmpNotifResp::new(self.request.id, 0, err, 0)
     }
 
+    /// Returns value to supervised process.
     pub fn return_syscall(&self, val: i64) -> libseccomp::ScmpNotifResp {
         libseccomp::ScmpNotifResp::new(self.request.id, val, 0, 0)
     }
 
+    /// Check if this event is still valid.
+    /// In some cases this is necessary, please check seccomp_unotify(2) for more information.
     pub fn is_valid(&self) -> bool {
         libseccomp::notify_id_valid(self.notify_fd, self.request.id).is_ok()
     }
 
+    /// Add a file descriptor to the supervised process.
+    /// This could help avoid TOCTOU attack in some cases.
     pub fn add_fd(&self, src_fd: RawFd) -> Result<RawFd, io::Error> {
         let addfd: libseccomp_sys::seccomp_notif_addfd = libseccomp_sys::seccomp_notif_addfd {
             id: self.request.id,
@@ -207,12 +220,20 @@ impl UNotifyEventRequest {
     }
 }
 
+/// By using `RemoteProcess`, you can get some information about the supervised process.
 pub struct RemoteProcess {
     pid: Pid,
     fd: RawFd,
 }
 
 impl RemoteProcess {
+    /// Create a `RemoteProcess` object from a `Pid`.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let remote = RemoteProcess::new(Pid::from_raw(req.request.pid as i32)).unwrap();
+    /// ```
     pub fn new(pid: Pid) -> Result<Self, io::Error> {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
         if fd < 0 {
@@ -225,8 +246,8 @@ impl RemoteProcess {
         }
     }
 
-    // pidfd_getfd(), Linux 5.6
-    /// Get file descriptor from remote process. This function requires Linux 5.6+.
+    /// Get file descriptor from remote process with `pidfd_getfd()`.
+    /// This function requires Linux 5.6+.
     pub fn get_fd(&self, remote_fd: RawFd) -> Result<RawFd, io::Error> {
         let local_fd = unsafe { libc::syscall(libc::SYS_pidfd_getfd, self.fd, remote_fd, 0) };
         if local_fd < 0 {
@@ -236,10 +257,15 @@ impl RemoteProcess {
         }
     }
 
-    // process_vm_readv
-    /// Read data from remote process's memory.
+    /// Read data from remote process's memory with `process_vm_readv()`.
     /// You should run is_valid() after this method to check if the remote process and corresponding syscall
     /// is still alive.
+    ///
+    /// # Examples
+    /// ```ignore
+    /// let mut buf = [0u8; 256];
+    /// remote.read_mem(&mut buf, path as usize).unwrap();
+    /// ```
     pub fn read_mem(
         &self,
         local_buffer: &mut [u8],
@@ -264,6 +290,7 @@ impl Drop for RemoteProcess {
 
 type UserHookFunc = fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp;
 
+/// The main component of greenhook.
 pub struct Supervisor {
     pub handlers: HashMap<ScmpSyscall, UserHookFunc>,
     socket_pair: SocketPair,
@@ -283,7 +310,21 @@ macro_rules! loop_while_eintr {
 }
 
 impl Supervisor {
+    /// Create a new `Supervisor` object. You can specify the number of threads in the thread pool.
+    /// This function will also check your kernel version and show warning or return error if necessary.
+    ///
+    /// # Examples
+    /// ```
+    /// use greenhook::Supervisor;
+    /// let supervisor = Supervisor::new(4).unwrap();
+    /// ```
     pub fn new(thread_num: usize) -> Result<Self, io::Error> {
+        if thread_num == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "thread_num should be greater than 0",
+            ));
+        }
         // detect kernel version and show warning
         let version = uname().map_err(|e| io::Error::from_raw_os_error(e as i32))?;
         let version = version.release();
@@ -328,8 +369,14 @@ impl Supervisor {
 
     /// Run a command with seccomp filter.
     /// This method will fork a child process, do some preparations and run the command in it.
-    /// It returns a Child and a JoinHandle. The Child is the child process, and the JoinHandle
-    /// is the supervisor thread. You should use `Supervisor::wait()` to wait for the child process.
+    /// It returns a Child, a JoinHandle of supervising thread, and a ThreadPool handle of syscall user functions.
+    /// It's recommended to use `Supervisor::wait()` to wait for the child process.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let (mut child, handle, pool) = supervisor.exec(&mut cmd).unwrap();
+    /// ```
     pub fn exec(self, cmd: &mut Command) -> Result<(Child, JoinHandle<()>, ThreadPool), io::Error> {
         let (sender, receiver) = self.socket_pair.channel();
         let syscall_list: Vec<_> = self.handlers.keys().copied().collect();
@@ -441,7 +488,14 @@ impl Supervisor {
         Ok((child, thread_handle, pool_handle))
     }
 
-    /// Wait for the child process to exit and cleanup the supervisor thread.
+    /// Wait for the child process to exit and cleanup the supervisor thread and thread pool.
+    /// It returns `WaitStatus` of the child process.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let status = Supervisor::wait(&mut child, thread_handle, pool).unwrap();
+    /// ```
     pub fn wait(
         child: &mut Child,
         thread_handle: JoinHandle<()>,
@@ -502,7 +556,7 @@ mod tests {
         supervisor
             .handlers
             .insert(ScmpSyscall::new("geteuid"), geteuid_handler);
-        let mut cmd = Command::new("/bin/whoami");
+        let mut cmd = Command::new("/usr/bin/whoami");
         let cmd = cmd.stdout(Stdio::piped());
         let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
         let status = Supervisor::wait(&mut child, thread_handle, pool).unwrap();
