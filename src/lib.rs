@@ -9,17 +9,21 @@ use std::{
 };
 
 use libseccomp::{ScmpAction, ScmpFilterContext, ScmpNotifReq, ScmpNotifRespFlags, ScmpSyscall};
-use log::debug;
+use log::{debug, error, info, warn};
 use nix::{
     cmsg_space,
     errno::Errno,
-    libc::{self, c_uint, c_void, cmsghdr, msghdr, CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_SPACE},
+    libc::{
+        self, c_uint, c_void, cmsghdr, ioctl, msghdr, CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN,
+        CMSG_SPACE,
+    },
     poll::{PollFd, PollFlags},
     sys::{
         socket::{
             recvmsg, socketpair, AddressFamily, ControlMessageOwned, MsgFlags, SockFlag, SockType,
         },
         uio::{process_vm_readv, RemoteIoVec},
+        utsname::uname,
     },
     unistd::{close, Pid},
 };
@@ -57,8 +61,15 @@ impl SocketPair {
         })
     }
 
-    pub(crate) fn channel(self) -> (Sender, Receiver) {
+    pub(crate) fn channel(&self) -> (Sender, Receiver) {
         (Sender { fd: self.sender }, Receiver { fd: self.receiver })
+    }
+}
+
+impl Drop for SocketPair {
+    fn drop(&mut self) {
+        let _ = close(self.sender);
+        let _ = close(self.receiver);
     }
 }
 
@@ -114,12 +125,6 @@ impl Sender {
     }
 }
 
-impl Drop for Sender {
-    fn drop(&mut self) {
-        let _ = close(self.fd);
-    }
-}
-
 impl Receiver {
     pub(crate) fn recvfd(&self) -> Result<RawFd, io::Error> {
         let mut cmsg_buffer = cmsg_space!(RawFd);
@@ -138,12 +143,6 @@ impl Receiver {
             }
         }
         Err(io::Error::from_raw_os_error(libc::EINVAL))
-    }
-}
-
-impl Drop for Receiver {
-    fn drop(&mut self) {
-        let _ = close(self.fd);
     }
 }
 
@@ -181,6 +180,30 @@ impl UNotifyEventRequest {
 
     pub fn is_valid(&self) -> bool {
         libseccomp::notify_id_valid(self.notify_fd, self.request.id).is_ok()
+    }
+
+    pub fn add_fd(&self, src_fd: RawFd) -> Result<RawFd, io::Error> {
+        let addfd: libseccomp_sys::seccomp_notif_addfd = libseccomp_sys::seccomp_notif_addfd {
+            id: self.request.id,
+            flags: 0,
+            srcfd: src_fd as u32,
+            newfd: 0,
+            newfd_flags: 0,
+        };
+        const SECCOMP_IOCTL_NOTIF_ADDFD: u64 = 0x40182103;
+
+        let new_fd = unsafe {
+            ioctl(
+                self.notify_fd,
+                SECCOMP_IOCTL_NOTIF_ADDFD,
+                &addfd as *const _,
+            )
+        };
+        if new_fd < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(new_fd as RawFd)
+        }
     }
 }
 
@@ -261,6 +284,41 @@ macro_rules! loop_while_eintr {
 
 impl Supervisor {
     pub fn new(thread_num: usize) -> Result<Self, io::Error> {
+        // detect kernel version and show warning
+        let version = uname().map_err(|e| io::Error::from_raw_os_error(e as i32))?;
+        let version = version.release();
+
+        macro_rules! parse_error {
+            () => {
+                io::Error::new(io::ErrorKind::Other, "unknown version")
+            };
+        }
+
+        let (major, minor) = {
+            let mut iter = version.to_str().ok_or_else(|| parse_error!())?.split('.');
+            let major = iter
+                .next()
+                .unwrap()
+                .parse::<u32>()
+                .map_err(|_| parse_error!())?;
+            let minor = iter
+                .next()
+                .unwrap()
+                .parse::<u32>()
+                .map_err(|_| parse_error!())?;
+            (major, minor)
+        };
+        if major < 5 {
+            error!("Your kernel version is too old.");
+            return Err(io::Error::new(io::ErrorKind::Other, "kernel too old"));
+        } else if major == 5 && minor < 5 {
+            error!("Your kernel version is too old (Does not support SECCOMP_USER_NOTIF_FLAG_CONTINUE, etc.).");
+            return Err(io::Error::new(io::ErrorKind::Other, "kernel too old"));
+        } else if major == 5 && minor < 6 {
+            warn!("Your kernel version is too old (Does not support pidfd_getfd() and SECCOMP_IOCTL_NOTIF_ADDFD).");
+        } else if major == 5 && minor < 9 {
+            warn!("Your kernel version is too old (Does not support SECCOMP_IOCTL_NOTIF_ADDFD).");
+        }
         Ok(Supervisor {
             socket_pair: SocketPair::init()?,
             handlers: HashMap::new(),
@@ -271,7 +329,7 @@ impl Supervisor {
     /// Run a command with seccomp filter.
     /// This method will fork a child process, do some preparations and run the command in it.
     /// It returns a Child and a JoinHandle. The Child is the child process, and the JoinHandle
-    /// is the supervisor thread. You should use `Supervisor::wait()` to wait for the child process
+    /// is the supervisor thread. You should use `Supervisor::wait()` to wait for the child process.
     pub fn exec(self, cmd: &mut Command) -> Result<(Child, JoinHandle<()>, ThreadPool), io::Error> {
         let (sender, receiver) = self.socket_pair.channel();
         let syscall_list: Vec<_> = self.handlers.keys().copied().collect();
@@ -312,6 +370,7 @@ impl Supervisor {
         }
         let child = cmd.spawn()?;
         let fd = receiver.recvfd()?;
+        mem::drop(self.socket_pair);
 
         debug!("receiver got fd: {}", fd);
 
@@ -322,12 +381,12 @@ impl Supervisor {
                 let mut pollfd = [PollFd::new(fd, PollFlags::POLLIN)];
                 let poll_res = loop_while_eintr!(nix::poll::poll(&mut pollfd, -1));
                 if let Err(e) = poll_res {
-                    eprintln!("failed to poll: {}", e);
+                    error!("failed to poll: {}", e);
                     break;
                 }
                 match pollfd[0].revents() {
                     None => {
-                        eprintln!("unknown poll event");
+                        error!("unknown poll event");
                         break;
                     }
                     Some(revents) => {
@@ -336,13 +395,13 @@ impl Supervisor {
                         }
                     }
                 }
-                // eprintln!("{:?} {:?} {:?}", poll_res, pollfd[0].revents(), pollfd);
+                // debug!("{:?} {:?} {:?}", poll_res, pollfd[0].revents(), pollfd);
 
                 let req = ScmpNotifReq::receive(fd);
                 let req = match req {
                     Ok(req) => req,
                     Err(e) => {
-                        eprintln!("failed to receive notification: {}", e);
+                        error!("failed to receive notification: {}", e);
                         break;
                     }
                 };
@@ -355,7 +414,7 @@ impl Supervisor {
                         match event_req.fail_syscall(libc::ENOSYS).respond(fd) {
                             Ok(_) => {}
                             Err(e) => {
-                                eprintln!("failed to send response: {}", e);
+                                error!("failed to send response: {}", e);
                                 return;
                             }
                         };
@@ -366,13 +425,13 @@ impl Supervisor {
                     let response = handler(&event_req);
 
                     if !event_req.is_valid() {
-                        eprintln!("no need to respond to the request as it is invalid");
+                        info!("no need to respond to the request as it is invalid");
                         return;
                     }
                     match response.respond(fd) {
                         Ok(_) => {}
                         Err(e) => {
-                            eprintln!("failed to send response: {}", e);
+                            warn!("failed to send response: {}", e);
                         }
                     };
                 });
@@ -399,7 +458,7 @@ impl Supervisor {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::CStr, io::Read, process::Stdio, time::Duration};
+    use std::{ffi::CStr, fs::File, io::Read, os::fd::AsRawFd, process::Stdio, time::Duration};
 
     use super::*;
     use log::info;
@@ -497,5 +556,44 @@ mod tests {
             kill(Pid::from_raw(child_pid as i32), SIGKILL).unwrap();
         });
         let _ = Supervisor::wait(&mut child, thread_handle, pool).unwrap();
+    }
+
+    #[test]
+    fn test_new_fd() {
+        fn openat_handler(req: &UNotifyEventRequest) -> libseccomp::ScmpNotifResp {
+            let path = req.get_request().data.args[1];
+            let remote = RemoteProcess::new(Pid::from_raw(req.request.pid as i32)).unwrap();
+            let mut buf = [0u8; 256];
+            remote.read_mem(&mut buf, path as usize).unwrap();
+            debug!("open (read from remote): {:?}", buf);
+            let path = CStr::from_bytes_until_nul(&buf).unwrap();
+            if !req.is_valid() {
+                return req.fail_syscall(libc::EACCES);
+            }
+            debug!("open (path CStr): {:?}", path);
+            if path.to_str().unwrap() == "/etc/passwd" {
+                // open /etc/resolv.conf instead
+                let file = File::open("/etc/resolv.conf").unwrap();
+                let fd = file.as_raw_fd();
+                let remote_fd = req.add_fd(fd).unwrap();
+                req.return_syscall(remote_fd as i64)
+            } else {
+                unsafe { req.continue_syscall() }
+            }
+        }
+
+        let mut supervisor = Supervisor::new(2).unwrap();
+        supervisor
+            .handlers
+            .insert(ScmpSyscall::new("openat"), openat_handler);
+        let mut cmd = Command::new("/bin/cat");
+        let cmd = cmd.arg("/etc/passwd").stdout(Stdio::piped());
+        let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
+        let status = Supervisor::wait(&mut child, thread_handle, pool).unwrap();
+        assert!(status.success());
+        let cat_stdout = child.stdout.as_mut().unwrap();
+        let mut buf = String::new();
+        cat_stdout.read_to_string(&mut buf).unwrap();
+        assert!(buf.contains("nameserver"));
     }
 }
