@@ -23,6 +23,7 @@ use nix::{
     },
     unistd::{close, Pid},
 };
+use threadpool::ThreadPool;
 
 // SocketPair is used to copy fd from child to parent
 // with sendmsg/recvmsg and SCM_RIGHTS
@@ -238,20 +239,13 @@ impl Drop for RemoteProcess {
     }
 }
 
-type UserHookFunc = Box<dyn Fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp + Sync + Send>;
+type UserHookFunc = fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp;
 
 pub struct Supervisor {
     pub handlers: HashMap<ScmpSyscall, UserHookFunc>,
     socket_pair: SocketPair,
+    thread_pool: ThreadPool,
 }
-
-// pub unsafe fn cancel_thread(thread_handle: JoinHandle<()>) -> Result<(), io::Error> {
-//     let res = unsafe { pthread_cancel(thread_handle.into_pthread_t()) };
-//     if res != 0 {
-//         return Err(io::Error::last_os_error());
-//     }
-//     Ok(())
-// }
 
 macro_rules! loop_while_eintr {
     ($poll_expr: expr) => {
@@ -266,10 +260,11 @@ macro_rules! loop_while_eintr {
 }
 
 impl Supervisor {
-    pub fn new() -> Result<Self, io::Error> {
+    pub fn new(thread_num: usize) -> Result<Self, io::Error> {
         Ok(Supervisor {
             socket_pair: SocketPair::init()?,
             handlers: HashMap::new(),
+            thread_pool: ThreadPool::new(thread_num),
         })
     }
 
@@ -277,7 +272,7 @@ impl Supervisor {
     /// This method will fork a child process, do some preparations and run the command in it.
     /// It returns a Child and a JoinHandle. The Child is the child process, and the JoinHandle
     /// is the supervisor thread. You should use `Supervisor::wait()` to wait for the child process
-    pub fn exec(self, cmd: &mut Command) -> Result<(Child, JoinHandle<()>), io::Error> {
+    pub fn exec(self, cmd: &mut Command) -> Result<(Child, JoinHandle<()>, ThreadPool), io::Error> {
         let (sender, receiver) = self.socket_pair.channel();
         let syscall_list: Vec<_> = self.handlers.keys().copied().collect();
         unsafe {
@@ -320,6 +315,7 @@ impl Supervisor {
 
         debug!("receiver got fd: {}", fd);
 
+        let pool_handle = self.thread_pool.clone();
         let thread_handle = std::thread::spawn(move || {
             loop {
                 // Poll fd first: is it readable?
@@ -352,36 +348,51 @@ impl Supervisor {
                 };
                 let event_req = UNotifyEventRequest::new(req, fd);
                 let syscall_id = event_req.get_request().data.syscall;
-                let response = match self.handlers.get(&syscall_id) {
-                    Some(handler) => handler(&event_req),
+
+                let handler = match self.handlers.get(&syscall_id) {
+                    Some(handler) => *handler,
                     None => {
-                        eprintln!("no handler for syscall {}", syscall_id);
-                        event_req.fail_syscall(libc::ENOSYS)
+                        match event_req.fail_syscall(libc::ENOSYS).respond(fd) {
+                            Ok(_) => {}
+                            Err(e) => {
+                                eprintln!("failed to send response: {}", e);
+                                return;
+                            }
+                        };
+                        continue;
                     }
                 };
-                if !event_req.is_valid() {
-                    eprintln!("no need to respond to the request as it is invalid");
-                    continue;
-                }
-                match response.respond(fd) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        eprintln!("failed to send response: {}", e);
-                        break;
+                self.thread_pool.execute(move || {
+                    let response = handler(&event_req);
+
+                    if !event_req.is_valid() {
+                        eprintln!("no need to respond to the request as it is invalid");
+                        return;
                     }
-                };
+                    match response.respond(fd) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            eprintln!("failed to send response: {}", e);
+                        }
+                    };
+                });
             }
         });
 
-        Ok((child, thread_handle))
+        Ok((child, thread_handle, pool_handle))
     }
 
     /// Wait for the child process to exit and cleanup the supervisor thread.
-    pub fn wait(child: &mut Child, thread_handle: JoinHandle<()>) -> Result<ExitStatus, io::Error> {
+    pub fn wait(
+        child: &mut Child,
+        thread_handle: JoinHandle<()>,
+        pool_handle: ThreadPool,
+    ) -> Result<ExitStatus, io::Error> {
         let status = child.wait()?;
         thread_handle.join().map_err(|_| {
             io::Error::new(io::ErrorKind::Other, "failed to join supervisor thread")
         })?;
+        pool_handle.join();
         Ok(status)
     }
 }
@@ -397,41 +408,45 @@ mod tests {
 
     #[test]
     fn smoke_test_sleep() {
-        let mut supervisor = Supervisor::new().unwrap();
-        supervisor.handlers.insert(
-            ScmpSyscall::new("openat"),
-            Box::new(|req| {
-                let path = req.get_request().data.args[1];
-                let remote = RemoteProcess::new(Pid::from_raw(req.request.pid as i32)).unwrap();
-                let mut buf = [0u8; 256];
-                remote.read_mem(&mut buf, path as usize).unwrap();
-                debug!("open (read from remote): {:?}", buf);
-                let path = CStr::from_bytes_until_nul(&buf).unwrap();
-                if !req.is_valid() {
-                    return req.fail_syscall(libc::EACCES);
-                }
-                debug!("open (path CStr): {:?}", path);
-                unsafe { req.continue_syscall() }
-            }),
-        );
+        fn openat_handler(req: &UNotifyEventRequest) -> libseccomp::ScmpNotifResp {
+            let path = req.get_request().data.args[1];
+            let remote = RemoteProcess::new(Pid::from_raw(req.request.pid as i32)).unwrap();
+            let mut buf = [0u8; 256];
+            remote.read_mem(&mut buf, path as usize).unwrap();
+            debug!("open (read from remote): {:?}", buf);
+            let path = CStr::from_bytes_until_nul(&buf).unwrap();
+            if !req.is_valid() {
+                return req.fail_syscall(libc::EACCES);
+            }
+            debug!("open (path CStr): {:?}", path);
+            unsafe { req.continue_syscall() }
+        }
+
+        let mut supervisor = Supervisor::new(2).unwrap();
+        supervisor
+            .handlers
+            .insert(ScmpSyscall::new("openat"), openat_handler);
         let mut cmd = Command::new("/bin/sleep");
         let cmd = cmd.arg("1");
-        let (mut child, thread_handle) = supervisor.exec(cmd).unwrap();
-        let status = Supervisor::wait(&mut child, thread_handle).unwrap();
+        let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
+        let status = Supervisor::wait(&mut child, thread_handle, pool).unwrap();
         assert!(status.success());
     }
 
     #[test]
     fn smoke_test_whoami() {
-        let mut supervisor = Supervisor::new().unwrap();
-        supervisor.handlers.insert(
-            ScmpSyscall::new("geteuid"),
-            Box::new(|req| req.return_syscall(0)),
-        );
+        fn geteuid_handler(req: &UNotifyEventRequest) -> libseccomp::ScmpNotifResp {
+            req.return_syscall(0)
+        }
+
+        let mut supervisor = Supervisor::new(2).unwrap();
+        supervisor
+            .handlers
+            .insert(ScmpSyscall::new("geteuid"), geteuid_handler);
         let mut cmd = Command::new("/bin/whoami");
         let cmd = cmd.stdout(Stdio::piped());
-        let (mut child, thread_handle) = supervisor.exec(cmd).unwrap();
-        let status = Supervisor::wait(&mut child, thread_handle).unwrap();
+        let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
+        let status = Supervisor::wait(&mut child, thread_handle, pool).unwrap();
         assert!(status.success());
         let whoami_stdout = child.stdout.as_mut().unwrap();
         let mut buf = String::new();
@@ -441,47 +456,46 @@ mod tests {
 
     #[test]
     fn test_sleep_blocking_syscall() {
-        let mut supervisor = Supervisor::new().unwrap();
-        supervisor.handlers.insert(
-            ScmpSyscall::new("clock_nanosleep"),
-            Box::new(|req| {
-                // sleep for extra 60s
-                // Please note that it may bring A LOT OF PROBLEMS if you try using pthread_cancel
-                // So here we just use the easy way: check valid in the loop
-                let (tx, rx) = std::sync::mpsc::channel();
-                let handler = std::thread::spawn(move || {
-                    for _ in 0..60 {
-                        if rx.try_recv().is_ok() {
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_secs(1));
-                    }
-                });
-                // while handler is running, check valid in the loop
-                loop {
-                    if !req.is_valid() {
-                        // cancel the thread
-                        info!("canceling thread as req is invalid now");
-                        tx.send(()).unwrap();
-                        return req.fail_syscall(libc::EACCES);
-                    }
-                    if handler.is_finished() {
+        fn clock_nanosleep_handler(req: &UNotifyEventRequest) -> libseccomp::ScmpNotifResp {
+            // sleep for extra 60s
+            // Please note that it may bring A LOT OF PROBLEMS if you try using pthread_cancel
+            // So here we just use the easy way: check valid in the loop
+            let (tx, rx) = std::sync::mpsc::channel();
+            let handler = std::thread::spawn(move || {
+                for _ in 0..60 {
+                    if rx.try_recv().is_ok() {
                         break;
                     }
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_secs(1));
                 }
-                unsafe { req.continue_syscall() }
-            }),
-        );
+            });
+            // while handler is running, check valid in the loop
+            loop {
+                if !req.is_valid() {
+                    // cancel the thread
+                    info!("canceling thread as req is invalid now");
+                    tx.send(()).unwrap();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            handler.join().unwrap();
+            unsafe { req.continue_syscall() }
+        }
+
+        let mut supervisor = Supervisor::new(2).unwrap();
+        supervisor
+            .handlers
+            .insert(ScmpSyscall::new("clock_nanosleep"), clock_nanosleep_handler);
         let mut cmd = Command::new("/bin/sleep");
         let cmd = cmd.arg("120");
-        let (mut child, thread_handle) = supervisor.exec(cmd).unwrap();
+        let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
         let child_pid = child.id();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(1));
             // kill the child process
             kill(Pid::from_raw(child_pid as i32), SIGKILL).unwrap();
         });
-        let _ = Supervisor::wait(&mut child, thread_handle).unwrap();
+        let _ = Supervisor::wait(&mut child, thread_handle, pool).unwrap();
     }
 }
