@@ -188,7 +188,7 @@ pub struct RemoteProcess {
 }
 
 impl RemoteProcess {
-    fn new(pid: Pid) -> Result<Self, io::Error> {
+    pub fn new(pid: Pid) -> Result<Self, io::Error> {
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
         if fd < 0 {
             Err(io::Error::last_os_error())
@@ -235,11 +235,10 @@ impl Drop for RemoteProcess {
     }
 }
 
+type UserHookFunc = Box<dyn Fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp + Sync + Send>;
+
 pub struct Supervisor {
-    pub handlers: HashMap<
-        ScmpSyscall,
-        Box<dyn Fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp + Sync + Send>,
-    >,
+    pub handlers: HashMap<ScmpSyscall, UserHookFunc>,
     socket_pair: SocketPair,
 }
 
