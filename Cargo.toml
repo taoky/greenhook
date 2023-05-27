@@ -1,9 +1,9 @@
 [package]
 name = "greenhook"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "A seccomp-unotify-based syscall hook library"
-repository = "https://github.com/taoky/cgumi"
+repository = "https://github.com/taoky/greenhook"
 license = "Unlicense"
 readme = "README.md"
 
