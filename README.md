@@ -1,5 +1,7 @@
 # greenhook
 
+https://crates.io/crates/greenhook
+
 Greenhook is a seccomp-unotify-based syscall hook library. It is adapted from <https://github.com/pdlan/binder>.
 
 You could have it a try if you want to find alternatives other than `LD_PRELOAD` and `ptrace`. However, please note that seccomp unotify **IS NOT** a full replacement of these techniques, and take some time reading [`seccomp_unotify(2)`](https://man7.org/linux/man-pages/man2/seccomp_unotify.2.html) before you start.
