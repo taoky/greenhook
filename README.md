@@ -125,6 +125,8 @@ Run this with:
 ...
 ```
 
+See [`examples/binder.rs`](examples/binder.rs) for a more complicated example. It resembles the logic of <https://github.com/pdlan/binder> in Rust.
+
 ## Limitation
 
 1. Your hook functions are executed by supervisor process (thread), not supervised one! This means that you may find difficulties when you need to do something on behalf of supervised process.

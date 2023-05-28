@@ -1,6 +1,6 @@
 [package]
 name = "greenhook"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 description = "A seccomp-unotify-based syscall hook library"
 repository = "https://github.com/taoky/greenhook"
@@ -15,8 +15,10 @@ libseccomp = { version = "0.3.0", features = ["const-syscall"] }
 libseccomp-sys = "0.2.1"
 log = "0.4.17"
 nix = "0.26.2"
+procfs = { version = "0.15.1", default-features = false }
 threadpool = "1.8.1"
 
 [dev-dependencies]
 env_logger = "0.9"
 test-log = "0.2.11"
+resolv-conf = "0.7.0"
