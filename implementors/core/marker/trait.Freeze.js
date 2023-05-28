@@ -1,0 +1,3 @@
+(function() {var implementors = {
+"greenhook":[["impl Freeze for <a class=\"struct\" href=\"greenhook/struct.UNotifyEventRequest.html\" title=\"struct greenhook::UNotifyEventRequest\">UNotifyEventRequest</a>",1,["greenhook::UNotifyEventRequest"]],["impl Freeze for <a class=\"struct\" href=\"greenhook/struct.RemoteProcess.html\" title=\"struct greenhook::RemoteProcess\">RemoteProcess</a>",1,["greenhook::RemoteProcess"]],["impl Freeze for <a class=\"struct\" href=\"greenhook/struct.Supervisor.html\" title=\"struct greenhook::Supervisor\">Supervisor</a>",1,["greenhook::Supervisor"]]]
+};if (window.register_implementors) {window.register_implementors(implementors);} else {window.pending_implementors = implementors;}})()
