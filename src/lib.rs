@@ -5,6 +5,7 @@ use std::{
     os::{fd::RawFd, unix::process::CommandExt},
     process::{Child, Command, ExitStatus},
     ptr,
+    sync::Arc,
     thread::JoinHandle,
 };
 
@@ -27,6 +28,7 @@ use nix::{
     },
     unistd::{close, Pid},
 };
+use procfs::process::Process;
 use threadpool::ThreadPool;
 
 // SocketPair is used to copy fd from child to parent
@@ -178,8 +180,10 @@ impl UNotifyEventRequest {
     }
 
     /// Returns error to supervised process.
+    /// `err` parameter should be a number larger than 0.
     pub fn fail_syscall(&self, err: i32) -> libseccomp::ScmpNotifResp {
-        libseccomp::ScmpNotifResp::new(self.request.id, 0, err, 0)
+        debug_assert!(err > 0);
+        libseccomp::ScmpNotifResp::new(self.request.id, 0, -err, 0)
     }
 
     /// Returns value to supervised process.
@@ -221,6 +225,7 @@ impl UNotifyEventRequest {
 }
 
 /// By using `RemoteProcess`, you can get some information about the supervised process.
+#[derive(Debug)]
 pub struct RemoteProcess {
     pid: Pid,
     fd: RawFd,
@@ -235,12 +240,23 @@ impl RemoteProcess {
     /// let remote = RemoteProcess::new(Pid::from_raw(req.request.pid as i32)).unwrap();
     /// ```
     pub fn new(pid: Pid) -> Result<Self, io::Error> {
-        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
+        // get TGID of given pid (TID)
+        let tid_stat = Process::new(pid.as_raw())
+            .and_then(|p| p.status())
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("failed to get stat of pid {}: {}", pid, e),
+                )
+            })?;
+        let tgid = tid_stat.tgid;
+
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, tgid, 0) };
         if fd < 0 {
             Err(io::Error::last_os_error())
         } else {
             Ok(RemoteProcess {
-                pid,
+                pid: Pid::from_raw(tgid),
                 fd: fd as RawFd,
             })
         }
@@ -288,11 +304,11 @@ impl Drop for RemoteProcess {
     }
 }
 
-type UserHookFunc = fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp;
+type UserHookFunc = Box<dyn Fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp + Send + Sync>;
 
 /// The main component of greenhook.
 pub struct Supervisor {
-    pub handlers: HashMap<ScmpSyscall, UserHookFunc>,
+    handlers: HashMap<ScmpSyscall, Arc<UserHookFunc>>,
     socket_pair: SocketPair,
     thread_pool: ThreadPool,
 }
@@ -365,6 +381,34 @@ impl Supervisor {
             handlers: HashMap::new(),
             thread_pool: ThreadPool::new(thread_num),
         })
+    }
+
+    /// Insert a user-defined handler function for a syscall.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use greenhook::{Supervisor, UNotifyEventRequest};
+    /// use libseccomp::ScmpSyscall;
+    ///
+    /// fn close_handler(req: &UNotifyEventRequest) -> libseccomp::ScmpNotifResp {
+    ///     println!("close");
+    ///     unsafe { req.continue_syscall() }
+    /// }
+    ///
+    /// let mut supervisor = Supervisor::new(4).unwrap();
+    /// supervisor.insert_handler(ScmpSyscall::new("open"), |req| {
+    ///     println!("open: {}", req.get_request().data.args[0]);
+    ///     unsafe { req.continue_syscall() }
+    /// });
+    /// supervisor.insert_handler(ScmpSyscall::new("close"), close_handler);
+    /// ```
+    pub fn insert_handler(
+        &mut self,
+        syscall: ScmpSyscall,
+        handler: impl Fn(&UNotifyEventRequest) -> libseccomp::ScmpNotifResp + Send + Sync + 'static,
+    ) {
+        self.handlers.insert(syscall, Arc::new(Box::new(handler)));
     }
 
     /// Run a command with seccomp filter.
@@ -456,8 +500,9 @@ impl Supervisor {
                 let syscall_id = event_req.get_request().data.syscall;
 
                 let handler = match self.handlers.get(&syscall_id) {
-                    Some(handler) => *handler,
+                    Some(handler) => handler,
                     None => {
+                        warn!("got unknown syscall to handle: {}", syscall_id);
                         match event_req.fail_syscall(libc::ENOSYS).respond(fd) {
                             Ok(_) => {}
                             Err(e) => {
@@ -468,8 +513,9 @@ impl Supervisor {
                         continue;
                     }
                 };
+                let handler_in_thread = handler.clone();
                 self.thread_pool.execute(move || {
-                    let response = handler(&event_req);
+                    let response = handler_in_thread(&event_req);
 
                     if !event_req.is_valid() {
                         info!("no need to respond to the request as it is invalid");
@@ -536,9 +582,7 @@ mod tests {
         }
 
         let mut supervisor = Supervisor::new(2).unwrap();
-        supervisor
-            .handlers
-            .insert(ScmpSyscall::new("openat"), openat_handler);
+        supervisor.insert_handler(ScmpSyscall::new("openat"), openat_handler);
         let mut cmd = Command::new("/bin/sleep");
         let cmd = cmd.arg("1");
         let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
@@ -553,9 +597,7 @@ mod tests {
         }
 
         let mut supervisor = Supervisor::new(2).unwrap();
-        supervisor
-            .handlers
-            .insert(ScmpSyscall::new("geteuid"), geteuid_handler);
+        supervisor.insert_handler(ScmpSyscall::new("geteuid"), geteuid_handler);
         let mut cmd = Command::new("/usr/bin/whoami");
         let cmd = cmd.stdout(Stdio::piped());
         let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
@@ -597,9 +639,7 @@ mod tests {
         }
 
         let mut supervisor = Supervisor::new(2).unwrap();
-        supervisor
-            .handlers
-            .insert(ScmpSyscall::new("clock_nanosleep"), clock_nanosleep_handler);
+        supervisor.insert_handler(ScmpSyscall::new("clock_nanosleep"), clock_nanosleep_handler);
         let mut cmd = Command::new("/bin/sleep");
         let cmd = cmd.arg("120");
         let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
@@ -637,9 +677,7 @@ mod tests {
         }
 
         let mut supervisor = Supervisor::new(2).unwrap();
-        supervisor
-            .handlers
-            .insert(ScmpSyscall::new("openat"), openat_handler);
+        supervisor.insert_handler(ScmpSyscall::new("openat"), openat_handler);
         let mut cmd = Command::new("/bin/cat");
         let cmd = cmd.arg("/etc/passwd").stdout(Stdio::piped());
         let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();

@@ -12,9 +12,7 @@ fn main() {
     // Get argv[1]
     let program = std::env::args().nth(1).unwrap();
     let mut supervisor = Supervisor::new(2).unwrap();
-    supervisor
-        .handlers
-        .insert(ScmpSyscall::new("geteuid"), geteuid_handler);
+    supervisor.insert_handler(ScmpSyscall::new("geteuid"), geteuid_handler);
     let mut cmd = Command::new(program);
     let (mut child, thread_handle, pool) = supervisor.exec(&mut cmd).unwrap();
     let _ = Supervisor::wait(&mut child, thread_handle, pool).unwrap();

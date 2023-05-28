@@ -1,9 +1,9 @@
-use std::{process::Command, ffi::CStr, fs::File, os::fd::AsRawFd};
+use std::{ffi::CStr, fs::File, os::fd::AsRawFd, process::Command};
 
-use greenhook::{Supervisor, UNotifyEventRequest, RemoteProcess};
+use greenhook::{RemoteProcess, Supervisor, UNotifyEventRequest};
 use libseccomp::ScmpSyscall;
 use log::info;
-use nix::{unistd::Pid, libc};
+use nix::{libc, unistd::Pid};
 
 fn openat_handler(req: &UNotifyEventRequest) -> libseccomp::ScmpNotifResp {
     let path = req.get_request().data.args[1];
@@ -32,12 +32,13 @@ fn main() {
     // Get argv[1..]
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.len() == 0 {
-        panic!("Usage: {} <program> [args...]", std::env::args().nth(0).unwrap());
+        panic!(
+            "Usage: {} <program> [args...]",
+            std::env::args().nth(0).unwrap()
+        );
     }
     let mut supervisor = Supervisor::new(2).unwrap();
-    supervisor
-        .handlers
-        .insert(ScmpSyscall::new("openat"), openat_handler);
+    supervisor.insert_handler(ScmpSyscall::new("openat"), openat_handler);
     let mut cmd = Command::new(args[0].clone());
     let cmd = cmd.args(&args[1..]);
     let (mut child, thread_handle, pool) = supervisor.exec(cmd).unwrap();
